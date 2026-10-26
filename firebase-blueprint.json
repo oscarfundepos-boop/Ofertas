@@ -1,0 +1,168 @@
+{
+  "entities": {
+    "Admin": {
+      "title": "Admin",
+      "description": "Lista de administradores del sistema para control de acceso y RBAC",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Correo electrónico del administrador"
+        },
+        "role": {
+          "type": "string",
+          "description": "Rol fijo admin"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Fecha y hora de designación como administrador"
+        }
+      },
+      "required": ["email", "role"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil de usuario del sistema (administradores o asesores finales de seguros)",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "ID único de Firebase Auth"
+        },
+        "email": {
+          "type": "string",
+          "description": "Correo electrónico del usuario"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Nombre completo del usuario"
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "URL del avatar de Google"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "asesor"],
+          "description": "Rol asignado en el sistema"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended"],
+          "description": "Estado de la cuenta"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Fecha de registro"
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "description": "Última fecha de inicio de sesión"
+        }
+      },
+      "required": ["uid", "email", "displayName", "role", "status"]
+    },
+    "ComparisonRecord": {
+      "title": "ComparisonRecord",
+      "description": "Registro histórico persistente de comparaciones ejecutadas por los asesores",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identificador único de la comparación"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID del asesor que generó la comparación"
+        },
+        "userEmail": {
+          "type": "string",
+          "description": "Correo del asesor"
+        },
+        "clientName": {
+          "type": "string",
+          "description": "Nombre del cliente"
+        },
+        "vehicle": {
+          "type": "string",
+          "description": "Vehículo evaluado"
+        },
+        "budget": {
+          "type": "number",
+          "description": "Presupuesto máximo en colones"
+        },
+        "proposalsCount": {
+          "type": "number",
+          "description": "Cantidad de propuestas comparadas"
+        },
+        "recommendation": {
+          "type": "string",
+          "description": "Recomendación preliminar generada"
+        },
+        "whatsappMessage": {
+          "type": "string",
+          "description": "Mensaje para el cliente redactado para WhatsApp"
+        },
+        "proposalsSummary": {
+          "type": "string",
+          "description": "Resumen serializado de las aseguradoras y semáforos"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Fecha y hora de generación"
+        }
+      },
+      "required": ["id", "userId", "clientName", "vehicle", "budget", "proposalsCount", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Registro de auditoría y seguridad de acciones críticas en producción",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "ID del evento de auditoría"
+        },
+        "action": {
+          "type": "string",
+          "description": "Tipo de acción ejecutada (ej. login, comparison_run, user_updated)"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID del autor de la acción"
+        },
+        "userEmail": {
+          "type": "string",
+          "description": "Email del autor"
+        },
+        "details": {
+          "type": "string",
+          "description": "Detalles o metadatos de la acción"
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Marca de tiempo del evento"
+        }
+      },
+      "required": ["id", "action", "userId", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/admins/{adminId}": {
+      "schema": "#/entities/Admin",
+      "description": "Colección de administradores verificados para control de acceso"
+    },
+    "/users/{userId}": {
+      "schema": "#/entities/UserProfile",
+      "description": "Perfiles de usuarios y asesores autorizados"
+    },
+    "/comparisons/{comparisonId}": {
+      "schema": "#/entities/ComparisonRecord",
+      "description": "Historial de comparaciones generadas por los asesores"
+    },
+    "/audit_logs/{logId}": {
+      "schema": "#/entities/AuditLog",
+      "description": "Trazabilidad y auditoría de eventos de seguridad"
+    }
+  }
+}

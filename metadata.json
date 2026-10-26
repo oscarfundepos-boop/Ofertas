@@ -1,0 +1,6 @@
+{
+  "name": "Comparador de Propuestas BN",
+  "description": "Compara propuestas de seguro de automóvil en minutos para corredora de seguros en Costa Rica con asistencia de IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

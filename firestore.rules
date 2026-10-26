@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Bootstrapped admin check against trusted collection and runtime admin email
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'oscar.fundepos@gmail.com'
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Validation for UserProfile
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'status']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'role', 'status', 'createdAt', 'lastLoginAt']) &&
+        data.uid is string && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() <= 150 &&
+        (data.role == 'admin' || data.role == 'asesor') &&
+        (data.status == 'active' || data.status == 'suspended');
+    }
+
+    // Validation for ComparisonRecord
+    function isValidComparison(data) {
+      return data.keys().hasAll(['id', 'userId', 'clientName', 'vehicle', 'budget', 'proposalsCount', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'userId', 'userEmail', 'clientName', 'vehicle', 'budget', 'proposalsCount', 'recommendation', 'whatsappMessage', 'proposalsSummary', 'createdAt']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.clientName is string && data.clientName.size() <= 200 &&
+        data.vehicle is string && data.vehicle.size() <= 200 &&
+        data.budget is number &&
+        data.proposalsCount is number;
+    }
+
+    // Validation for AuditLog
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'action', 'userId', 'timestamp']) &&
+        data.keys().hasOnly(['id', 'action', 'userId', 'userEmail', 'details', 'timestamp']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.action is string && data.action.size() <= 100 &&
+        data.userId is string && data.userId.size() <= 128;
+    }
+
+    // Admins Collection
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && isValidId(adminId);
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && isValidId(userId) && isOwner(userId) && isValidUser(incoming()) && (
+        incoming().role == 'asesor' ||
+        (incoming().role == 'admin' && request.auth.token.email == 'oscar.fundepos@gmail.com')
+      );
+      allow update: if isSignedIn() && isValidId(userId) && (
+        (isOwner(userId) && isValidUser(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'lastLoginAt'])) ||
+        (isAdmin() && isValidUser(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'lastLoginAt']))
+      );
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // Comparisons History Collection
+    match /comparisons/{comparisonId} {
+      allow get: if isSignedIn() && isValidId(comparisonId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidId(comparisonId) && isValidComparison(incoming()) && incoming().userId == request.auth.uid;
+      allow update: if isAdmin() && isValidId(comparisonId) && isValidComparison(incoming());
+      allow delete: if isSignedIn() && isValidId(comparisonId) && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Audit Logs Collection (Immutable events)
+    match /audit_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isSignedIn() && isValidId(logId) && isValidAuditLog(incoming()) && incoming().userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
