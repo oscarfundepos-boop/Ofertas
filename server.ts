@@ -2,8 +2,11 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import bcrypt from 'bcryptjs';
+import cookieParser from 'cookie-parser';
 
 dotenv.config();
 
@@ -12,10 +15,518 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const SESSION_SECRET = process.env.SESSION_SECRET || 'bn_corredora_secret_session_2026_cr';
 
 // Allow large payloads for base64 PDFs
 app.use(express.json({ limit: '60mb' }));
 app.use(express.urlencoded({ limit: '60mb', extended: true }));
+app.use(cookieParser(SESSION_SECRET));
+
+// --- DATA PERSISTENCE & SCHEMAS ---
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'usuarios.json');
+const COMPARISONS_FILE = path.join(DATA_DIR, 'comparaciones.json');
+const AUDIT_FILE = path.join(DATA_DIR, 'auditoria.json');
+
+export interface Usuario {
+  id: string;
+  usuario: string; // nombre corto, sin espacios, en minúsculas
+  nombre: string;
+  rol: 'administrador' | 'asesor';
+  estado: 'activo' | 'suspendido';
+  debeCambiarClave: boolean;
+  fechaCreacion: string;
+  ultimoAcceso: string;
+  claveHash: string;
+}
+
+export type SafeUsuario = Omit<Usuario, 'claveHash'>;
+
+export interface ComparacionGuardada {
+  id: string;
+  usuarioId: string;
+  usuario: string;
+  nombreCliente: string;
+  vehiculo: string;
+  presupuesto: number;
+  cantidadPropuestas: number;
+  recomendacion: string;
+  mensajeWhatsApp: string;
+  propuestasResumen: string;
+  fechaCreacion: string;
+}
+
+export interface RegistroAuditoria {
+  id: string;
+  accion: string;
+  userId: string;
+  usuario: string;
+  detalles: string;
+  timestamp: string;
+}
+
+// Ensure directory and initialize data files
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+// Initial Admin creation if usuarios.json does not exist
+if (!fs.existsSync(USERS_FILE)) {
+  const salt = bcrypt.genSaltSync(10);
+  const hash = bcrypt.hashSync('Fundepos2026*', salt);
+  const adminInicial: Usuario = {
+    id: 'usr_admin',
+    usuario: 'admin',
+    nombre: 'Administrador',
+    rol: 'administrador',
+    estado: 'activo',
+    debeCambiarClave: true,
+    fechaCreacion: new Date().toISOString(),
+    ultimoAcceso: new Date().toISOString(),
+    claveHash: hash,
+  };
+  fs.writeFileSync(USERS_FILE, JSON.stringify([adminInicial], null, 2), 'utf-8');
+  console.log('Archivo data/usuarios.json inicializado con usuario "admin" (Fundepos2026*).');
+}
+
+if (!fs.existsSync(COMPARISONS_FILE)) {
+  fs.writeFileSync(COMPARISONS_FILE, JSON.stringify([], null, 2), 'utf-8');
+}
+
+if (!fs.existsSync(AUDIT_FILE)) {
+  fs.writeFileSync(AUDIT_FILE, JSON.stringify([], null, 2), 'utf-8');
+}
+
+// Helpers for data reading / writing
+function leerUsuarios(): Usuario[] {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8') || '[]');
+  } catch (err) {
+    console.error('Error leyendo usuarios.json:', err);
+    return [];
+  }
+}
+
+function guardarUsuarios(usuarios: Usuario[]): void {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(usuarios, null, 2), 'utf-8');
+}
+
+function getSafeUser(u: Usuario): SafeUsuario {
+  const { claveHash, ...safe } = u;
+  return safe;
+}
+
+function leerComparaciones(): ComparacionGuardada[] {
+  try {
+    if (!fs.existsSync(COMPARISONS_FILE)) return [];
+    return JSON.parse(fs.readFileSync(COMPARISONS_FILE, 'utf-8') || '[]');
+  } catch (err) {
+    console.error('Error leyendo comparaciones.json:', err);
+    return [];
+  }
+}
+
+function guardarComparaciones(comparaciones: ComparacionGuardada[]): void {
+  fs.writeFileSync(COMPARISONS_FILE, JSON.stringify(comparaciones, null, 2), 'utf-8');
+}
+
+function registrarAuditoria(accion: string, userId: string, usuario: string, detalles: string): void {
+  try {
+    const logs: RegistroAuditoria[] = JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf-8') || '[]');
+    logs.unshift({
+      id: 'aud_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      accion,
+      userId,
+      usuario,
+      detalles,
+      timestamp: new Date().toISOString(),
+    });
+    fs.writeFileSync(AUDIT_FILE, JSON.stringify(logs.slice(0, 1500), null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Error guardando auditoría:', err);
+  }
+}
+
+// --- SESSION MANAGEMENT (8 HOURS COOKIE) ---
+interface SessionInfo {
+  sessionId: string;
+  userId: string;
+  createdAt: number;
+  expiresAt: number;
+}
+const sessions = new Map<string, SessionInfo>();
+
+// Middleware: Authenticated User & Active check
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const sessionId = req.signedCookies?.bn_session;
+  if (!sessionId) {
+    return res.status(401).json({ error: 'No autorizado. Debe iniciar sesión.' });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) sessions.delete(sessionId);
+    res.clearCookie('bn_session', { path: '/' });
+    return res.status(401).json({ error: 'Sesión expirada. Inicie sesión nuevamente.' });
+  }
+
+  const usuarios = leerUsuarios();
+  const user = usuarios.find((u) => u.id === session.userId);
+  if (!user) {
+    sessions.delete(sessionId);
+    res.clearCookie('bn_session', { path: '/' });
+    return res.status(401).json({ error: 'Usuario no encontrado.' });
+  }
+
+  if (user.estado === 'suspendido') {
+    return res.status(401).json({ error: 'usuario suspendido, contacte al administrador' });
+  }
+
+  (req as any).user = user;
+  next();
+}
+
+// Middleware: Admin role check
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const user = (req as any).user as Usuario;
+  if (user?.rol !== 'administrador') {
+    return res.status(403).json({ error: 'Acceso denegado. Se requiere rol de administrador.' });
+  }
+  next();
+}
+
+// --- AUTHENTICATION ENDPOINTS ---
+
+// POST /api/login (usuario y contraseña)
+app.post('/api/login', (req, res) => {
+  try {
+    const { usuario, clave, password } = req.body;
+    const inputClave = clave || password;
+
+    if (!usuario || !inputClave) {
+      return res.status(400).json({ error: 'Debe ingresar usuario y contraseña.' });
+    }
+
+    const cleanUser = String(usuario).trim().toLowerCase();
+    const usuarios = leerUsuarios();
+    const user = usuarios.find((u) => u.usuario.toLowerCase() === cleanUser);
+
+    if (!user) {
+      return res.status(401).json({ error: 'usuario o contraseña incorrectos' });
+    }
+
+    const claveValida = bcrypt.compareSync(String(inputClave), user.claveHash);
+    if (!claveValida) {
+      return res.status(401).json({ error: 'usuario o contraseña incorrectos' });
+    }
+
+    if (user.estado === 'suspendido') {
+      return res.status(403).json({ error: 'usuario suspendido, contacte al administrador' });
+    }
+
+    // Create session (8 hours = 28,800,000 ms)
+    const sessionId = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + 8 * 60 * 60 * 1000;
+    sessions.set(sessionId, {
+      sessionId,
+      userId: user.id,
+      createdAt: Date.now(),
+      expiresAt,
+    });
+
+    user.ultimoAcceso = new Date().toISOString();
+    guardarUsuarios(usuarios);
+
+    registrarAuditoria('LOGIN', user.id, user.usuario, 'Inicio de sesión exitoso');
+
+    res.cookie('bn_session', sessionId, {
+      httpOnly: true,
+      signed: true,
+      maxAge: 8 * 60 * 60 * 1000,
+      sameSite: 'lax',
+      path: '/',
+    });
+
+    return res.json({
+      success: true,
+      user: getSafeUser(user),
+    });
+  } catch (err: any) {
+    console.error('Error en /api/login:', err);
+    return res.status(500).json({ error: 'Error interno al procesar el inicio de sesión.' });
+  }
+});
+
+// POST /api/logout
+app.post('/api/logout', (req, res) => {
+  const sessionId = req.signedCookies?.bn_session;
+  if (sessionId && sessions.has(sessionId)) {
+    const s = sessions.get(sessionId);
+    if (s) {
+      const usuarios = leerUsuarios();
+      const u = usuarios.find((x) => x.id === s.userId);
+      if (u) {
+        registrarAuditoria('LOGOUT', u.id, u.usuario, 'Cierre de sesión');
+      }
+    }
+    sessions.delete(sessionId);
+  }
+  res.clearCookie('bn_session', { path: '/' });
+  return res.json({ success: true, message: 'Sesión cerrada exitosamente.' });
+});
+
+// GET /api/yo (devuelve el usuario conectado)
+app.get('/api/yo', requireAuth, (req, res) => {
+  const user = (req as any).user as Usuario;
+  return res.json({
+    success: true,
+    user: getSafeUser(user),
+  });
+});
+
+// POST /api/cambiar-clave (mínimo 8 caracteres, al menos un número)
+app.post('/api/cambiar-clave', requireAuth, (req, res) => {
+  try {
+    const user = (req as any).user as Usuario;
+    const { claveNueva } = req.body;
+
+    if (!claveNueva || typeof claveNueva !== 'string') {
+      return res.status(400).json({ error: 'Debe ingresar una nueva contraseña.' });
+    }
+
+    // Regla: mínimo 8 caracteres, al menos un número
+    const regexClave = /^(?=.*\d).{8,}$/;
+    if (!regexClave.test(claveNueva)) {
+      return res.status(400).json({
+        error: 'La nueva contraseña debe tener un mínimo de 8 caracteres y contener al menos un número.',
+      });
+    }
+
+    const salt = bcrypt.genSaltSync(10);
+    const hash = bcrypt.hashSync(claveNueva, salt);
+
+    const usuarios = leerUsuarios();
+    const idx = usuarios.findIndex((u) => u.id === user.id);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
+    }
+
+    usuarios[idx].claveHash = hash;
+    usuarios[idx].debeCambiarClave = false;
+    usuarios[idx].ultimoAcceso = new Date().toISOString();
+    guardarUsuarios(usuarios);
+
+    registrarAuditoria('CAMBIO_CLAVE', user.id, user.usuario, 'Contraseña cambiada exitosamente');
+
+    return res.json({
+      success: true,
+      message: 'Contraseña actualizada correctamente.',
+      user: getSafeUser(usuarios[idx]),
+    });
+  } catch (err: any) {
+    console.error('Error en /api/cambiar-clave:', err);
+    return res.status(500).json({ error: 'Error al cambiar la contraseña.' });
+  }
+});
+
+// --- USER MANAGEMENT (ADMIN ONLY) ---
+// GET /api/usuarios
+app.get('/api/usuarios', requireAuth, requireAdmin, (_req, res) => {
+  const usuarios = leerUsuarios();
+  return res.json({
+    success: true,
+    usuarios: usuarios.map(getSafeUser),
+  });
+});
+
+// POST /api/usuarios (Crear usuario nuevo)
+app.post('/api/usuarios', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const adminUser = (req as any).user as Usuario;
+    const { usuario, nombre, rol, clave } = req.body;
+
+    if (!usuario || !nombre || !rol) {
+      return res.status(400).json({ error: 'Todos los campos son requeridos (usuario, nombre, rol).' });
+    }
+
+    // usuario: nombre corto, sin espacios, en minúsculas
+    const cleanUser = String(usuario).trim().toLowerCase().replace(/\s+/g, '');
+    if (!/^[a-z0-9._-]+$/.test(cleanUser)) {
+      return res.status(400).json({ error: 'El nombre de usuario debe ser en minúsculas, sin espacios (solo letras, números, punto o guión).' });
+    }
+
+    const usuarios = leerUsuarios();
+    if (usuarios.some((u) => u.usuario.toLowerCase() === cleanUser)) {
+      return res.status(400).json({ error: 'El nombre de usuario ya está en uso.' });
+    }
+
+    const claveInicial = clave || 'Fundepos2026*';
+    const salt = bcrypt.genSaltSync(10);
+    const hash = bcrypt.hashSync(claveInicial, salt);
+
+    const nuevoUsuario: Usuario = {
+      id: 'usr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      usuario: cleanUser,
+      nombre: String(nombre).trim(),
+      rol: rol === 'administrador' ? 'administrador' : 'asesor',
+      estado: 'activo',
+      debeCambiarClave: true,
+      fechaCreacion: new Date().toISOString(),
+      ultimoAcceso: 'Nunca',
+      claveHash: hash,
+    };
+
+    usuarios.push(nuevoUsuario);
+    guardarUsuarios(usuarios);
+
+    registrarAuditoria('CREAR_USUARIO', adminUser.id, adminUser.usuario, `Creó usuario ${cleanUser} con rol ${nuevoUsuario.rol}`);
+
+    return res.json({
+      success: true,
+      usuario: getSafeUser(nuevoUsuario),
+    });
+  } catch (err: any) {
+    console.error('Error creando usuario:', err);
+    return res.status(500).json({ error: 'Error al registrar el nuevo usuario.' });
+  }
+});
+
+// PATCH /api/usuarios/:id (Cambiar rol o estado)
+app.patch('/api/usuarios/:id', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const adminUser = (req as any).user as Usuario;
+    const { id } = req.params;
+    const { rol, estado, resetearClave } = req.body;
+
+    const usuarios = leerUsuarios();
+    const idx = usuarios.findIndex((u) => u.id === id);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
+    }
+
+    // Proteger al admin principal
+    if (usuarios[idx].usuario === 'admin' && estado === 'suspendido') {
+      return res.status(400).json({ error: 'No es posible suspender al administrador principal.' });
+    }
+
+    if (rol && (rol === 'administrador' || rol === 'asesor')) {
+      usuarios[idx].rol = rol;
+    }
+
+    if (estado && (estado === 'activo' || estado === 'suspendido')) {
+      usuarios[idx].estado = estado;
+    }
+
+    if (resetearClave) {
+      const salt = bcrypt.genSaltSync(10);
+      usuarios[idx].claveHash = bcrypt.hashSync('Fundepos2026*', salt);
+      usuarios[idx].debeCambiarClave = true;
+    }
+
+    guardarUsuarios(usuarios);
+    registrarAuditoria('MODIFICAR_USUARIO', adminUser.id, adminUser.usuario, `Modificó al usuario ${usuarios[idx].usuario}`);
+
+    return res.json({
+      success: true,
+      usuario: getSafeUser(usuarios[idx]),
+    });
+  } catch (err: any) {
+    console.error('Error actualizando usuario:', err);
+    return res.status(500).json({ error: 'Error al actualizar el usuario.' });
+  }
+});
+
+// --- SAVED COMPARISONS & AUDIT ENDPOINTS (FILE BASED) ---
+
+// POST /api/comparaciones (Guardar comparación)
+app.post('/api/comparaciones', requireAuth, (req, res) => {
+  try {
+    const user = (req as any).user as Usuario;
+    const { nombreCliente, vehiculo, presupuesto, cantidadPropuestas, recomendacion, mensajeWhatsApp, propuestasResumen } = req.body;
+
+    const nuevaComp: ComparacionGuardada = {
+      id: 'comp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      usuarioId: user.id,
+      usuario: user.usuario,
+      nombreCliente: nombreCliente || 'Cliente particular',
+      vehiculo: vehiculo || 'Vehículo particular',
+      presupuesto: Number(presupuesto) || 0,
+      cantidadPropuestas: Number(cantidadPropuestas) || 0,
+      recomendacion: recomendacion || '',
+      mensajeWhatsApp: mensajeWhatsApp || '',
+      propuestasResumen: typeof propuestasResumen === 'string' ? propuestasResumen : JSON.stringify(propuestasResumen || []),
+      fechaCreacion: new Date().toISOString(),
+    };
+
+    const comparaciones = leerComparaciones();
+    comparaciones.unshift(nuevaComp);
+    guardarComparaciones(comparaciones);
+
+    registrarAuditoria(
+      'COMPARACION_GUARDADA',
+      user.id,
+      user.usuario,
+      `Guardó comparativa para cliente "${nuevaComp.nombreCliente}" con ${nuevaComp.cantidadPropuestas} propuestas`
+    );
+
+    return res.json({ success: true, comparacion: nuevaComp });
+  } catch (err: any) {
+    console.error('Error guardando comparación:', err);
+    return res.status(500).json({ error: 'Error al guardar la comparación.' });
+  }
+});
+
+// GET /api/comparaciones (Listar comparaciones)
+app.get('/api/comparaciones', requireAuth, (req, res) => {
+  const user = (req as any).user as Usuario;
+  const comparaciones = leerComparaciones();
+
+  if (user.rol === 'administrador') {
+    return res.json({ success: true, comparaciones });
+  } else {
+    const userComps = comparaciones.filter((c) => c.usuarioId === user.id);
+    return res.json({ success: true, comparaciones: userComps });
+  }
+});
+
+// DELETE /api/comparaciones/:id
+app.delete('/api/comparaciones/:id', requireAuth, (req, res) => {
+  try {
+    const user = (req as any).user as Usuario;
+    const { id } = req.params;
+
+    const comparaciones = leerComparaciones();
+    const comp = comparaciones.find((c) => c.id === id);
+    if (!comp) {
+      return res.status(404).json({ error: 'Comparación no encontrada.' });
+    }
+
+    if (comp.usuarioId !== user.id && user.rol !== 'administrador') {
+      return res.status(403).json({ error: 'No tienes permiso para eliminar esta comparación.' });
+    }
+
+    const filtradas = comparaciones.filter((c) => c.id !== id);
+    guardarComparaciones(filtradas);
+
+    registrarAuditoria('COMPARACION_ELIMINADA', user.id, user.usuario, `Eliminó la comparación ${id}`);
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error('Error eliminando comparación:', err);
+    return res.status(500).json({ error: 'Error al eliminar la comparación.' });
+  }
+});
+
+// GET /api/auditoria (Listar auditoría - admin)
+app.get('/api/auditoria', requireAuth, requireAdmin, (_req, res) => {
+  try {
+    const logs: RegistroAuditoria[] = JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf-8') || '[]');
+    return res.json({ success: true, logs });
+  } catch (err) {
+    return res.json({ success: true, logs: [] });
+  }
+});
 
 // Initialize Gemini client on server-side
 const ai = new GoogleGenAI({
@@ -48,8 +559,8 @@ export interface ProposalFile {
   base64: string;
 }
 
-// Endpoint to provide the 3 sample proposals already stored in public/assets/aistudio
-app.get('/api/sample-proposals', (_req, res) => {
+// Endpoint to provide the 3 sample proposals (PROTECTED WITH REQUIREAUTH)
+app.get('/api/sample-proposals', requireAuth, (_req, res) => {
   try {
     const assetsDir = path.join(__dirname, 'public', 'assets', 'aistudio');
     const sampleFiles = [
@@ -106,8 +617,8 @@ app.get('/api/sample-proposals', (_req, res) => {
   }
 });
 
-// Endpoint to extract client profile from a pasted message/text or an uploaded PDF
-app.post('/api/extract-client-profile', async (req, res) => {
+// Endpoint to extract client profile from text/pdf (PROTECTED WITH REQUIREAUTH)
+app.post('/api/extract-client-profile', requireAuth, async (req, res) => {
   try {
     const { text, pdfBase64, mimeType } = req.body;
 
@@ -220,9 +731,10 @@ REGLAS DE EXTRACCIÓN:
   }
 });
 
-// Endpoint to compare proposals with Gemini
-app.post('/api/compare', async (req, res) => {
+// Endpoint to compare proposals with Gemini (PROTECTED WITH REQUIREAUTH)
+app.post('/api/compare', requireAuth, async (req, res) => {
   try {
+    const user = (req as any).user as Usuario;
     const { files, profile }: { files: ProposalFile[]; profile: ProposalProfile } = req.body;
 
     if (!files || !Array.isArray(files) || files.length === 0) {
@@ -300,7 +812,7 @@ Entrega la respuesta en formato JSON estructurado conforme al schema requerido.
 `;
 
     // Prepare inline data parts for each PDF
-    const contentParts: any[] = files.map((file, idx) => ({
+    const contentParts: any[] = files.map((file) => ({
       inlineData: {
         mimeType: file.mimeType || 'application/pdf',
         data: file.base64,
@@ -416,6 +928,13 @@ Entrega la respuesta en formato JSON estructurado conforme al schema requerido.
         nombreArchivo: item.nombreArchivo || files[i]?.name || `Propuesta ${i + 1}`,
       }));
     }
+
+    registrarAuditoria(
+      'COMPARACION_EJECUTADA',
+      user.id,
+      user.usuario,
+      `Ejecutó comparación para cliente "${profile.nombre}" (${files.length} cotizaciones)`
+    );
 
     return res.json({
       success: true,

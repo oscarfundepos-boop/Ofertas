@@ -17,7 +17,6 @@ import {
   FileCheck,
   MessageCircle,
   Info,
-  ChevronRight,
   ShieldAlert,
   ShieldCheck,
   Loader2,
@@ -25,20 +24,19 @@ import {
   Sliders,
   FileUp,
   MessageSquareText,
-  PencilLine,
   X,
-  LogIn,
   LogOut,
   History,
   BookmarkCheck,
   Lock,
   Bookmark,
+  KeyRound,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
-import { useAuth } from './context/AuthContext.tsx';
-import { AdminPanel } from './components/AdminPanel.tsx';
-import { SavedComparisonsModal } from './components/SavedComparisonsModal.tsx';
-import { db, handleFirestoreError, OperationType } from './firebase.ts';
-import { doc, setDoc, collection, addDoc } from 'firebase/firestore';
+import { useAuth } from './context/AuthContext';
+import { AdminPanel } from './components/AdminPanel';
+import { SavedComparisonsModal } from './components/SavedComparisonsModal';
 
 interface CoberturasObligatorias {
   colision: boolean;
@@ -83,7 +81,32 @@ interface UploadedFile {
 }
 
 export default function App() {
-  const { currentUser, userProfile, isAdmin, loading: authLoading, loginWithGoogle, logout } = useAuth();
+  const {
+    user,
+    isAdmin,
+    loading: authLoading,
+    error: authError,
+    login,
+    logout,
+    cambiarClave,
+    clearError,
+  } = useAuth();
+
+  // Login form state
+  const [loginUsuario, setLoginUsuario] = useState('');
+  const [loginClave, setLoginClave] = useState('');
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  // Forced password change state
+  const [nuevaClave, setNuevaClave] = useState('');
+  const [confirmarClave, setConfirmarClave] = useState('');
+  const [claveSubmitting, setClaveSubmitting] = useState(false);
+  const [claveError, setClaveError] = useState<string | null>(null);
+  const [claveSuccess, setClaveSuccess] = useState(false);
+  const [showPass, setShowPass] = useState(false);
+
+  // Modals state
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
   const [isSavedModalOpen, setIsSavedModalOpen] = useState(false);
   const [isSavingRecord, setIsSavingRecord] = useState(false);
@@ -134,7 +157,6 @@ export default function App() {
       reader.readAsDataURL(file);
       reader.onload = () => {
         const res = reader.result as string;
-        // Strip data:...;base64, prefix
         const base64Data = res.split(',')[1] || '';
         resolve(base64Data);
       };
@@ -322,6 +344,59 @@ export default function App() {
     return Number(clean).toLocaleString('es-CR');
   };
 
+  // Handle Login submission
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    clearError();
+
+    const u = loginUsuario.trim().toLowerCase();
+    const p = loginClave;
+
+    if (!u || !p) {
+      setLoginError('Por favor ingresa tu usuario y contraseña.');
+      return;
+    }
+
+    setLoginSubmitting(true);
+    try {
+      await login(u, p);
+    } catch (err: any) {
+      setLoginError(err.message || 'usuario o contraseña incorrectos');
+    } finally {
+      setLoginSubmitting(false);
+    }
+  };
+
+  // Handle forced password change submission
+  const handleCambiarClaveSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setClaveError(null);
+
+    if (nuevaClave.length < 8) {
+      setClaveError('La nueva contraseña debe tener al menos 8 caracteres.');
+      return;
+    }
+    if (!/\d/.test(nuevaClave)) {
+      setClaveError('La nueva contraseña debe contener al menos un número.');
+      return;
+    }
+    if (nuevaClave !== confirmarClave) {
+      setClaveError('Las contraseñas no coinciden. Verifícalas cuidadosamente.');
+      return;
+    }
+
+    setClaveSubmitting(true);
+    try {
+      await cambiarClave(nuevaClave);
+      setClaveSuccess(true);
+    } catch (err: any) {
+      setClaveError(err.message || 'Error al actualizar la contraseña.');
+    } finally {
+      setClaveSubmitting(false);
+    }
+  };
+
   // Submit comparison
   const handleCompare = async () => {
     if (uploadedFiles.length === 0) {
@@ -400,47 +475,36 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Save comparison to production Firestore database
+  // Save comparison to server JSON database
   const handleSaveComparison = async () => {
-    if (!result || !currentUser) return;
+    if (!result || !user) return;
     setIsSavingRecord(true);
     setSaveSuccessMsg(null);
     try {
-      const compId = 'comp_' + Date.now();
       const numPresupuesto = Number(presupuesto.replace(/\D/g, '')) || 0;
-      const newDoc = {
-        id: compId,
-        userId: currentUser.uid,
-        userEmail: currentUser.email || '',
-        clientName: nombre || 'Cliente particular',
-        vehicle: vehiculo || 'Vehículo particular',
-        budget: numPresupuesto,
-        proposalsCount: result.aseguradoras.length,
-        recommendation: result.recomendacionPreliminar,
-        whatsappMessage: result.mensajeWhatsApp,
-        proposalsSummary: JSON.stringify(result.aseguradoras),
-        createdAt: new Date().toISOString(),
-      };
-      await setDoc(doc(db, 'comparisons', compId), newDoc);
+      const res = await fetch('/api/comparaciones', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientName: nombre || 'Cliente particular',
+          vehicle: vehiculo || 'Vehículo particular',
+          budget: numPresupuesto,
+          proposalsCount: result.aseguradoras.length,
+          recommendation: result.recomendacionPreliminar,
+          whatsappMessage: result.mensajeWhatsApp,
+          proposalsSummary: JSON.stringify(result.aseguradoras),
+        }),
+      });
 
-      // Log audit
-      try {
-        await addDoc(collection(db, 'audit_logs'), {
-          id: 'log_' + Date.now(),
-          action: 'COMPARISON_SAVED',
-          userId: currentUser.uid,
-          userEmail: currentUser.email || '',
-          details: `Comparación guardada para ${nombre} (${result.aseguradoras.length} cotizaciones)`,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (e) {
-        console.warn('Audit write error:', e);
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'No se pudo guardar la comparación.');
       }
 
-      setSaveSuccessMsg('¡Comparación guardada exitosamente en el historial seguro!');
+      setSaveSuccessMsg('¡Comparación guardada exitosamente en el servidor seguro!');
       setTimeout(() => setSaveSuccessMsg(null), 4000);
     } catch (err: any) {
-      handleFirestoreError(err, OperationType.CREATE, 'comparisons');
+      alert(err.message || 'Error al guardar la comparación.');
     } finally {
       setIsSavingRecord(false);
     }
@@ -515,22 +579,22 @@ export default function App() {
   // Screen while checking auth session
   if (authLoading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 font-sans">
         <div className="w-14 h-14 rounded-2xl bg-[#002B49] text-white flex items-center justify-center shadow-lg mb-4">
           <Shield className="w-8 h-8 text-emerald-400" />
         </div>
         <div className="flex items-center gap-2 text-slate-700 text-sm font-semibold">
           <Loader2 className="w-5 h-5 animate-spin text-[#002B49]" />
-          <span>Verificando credenciales de seguridad...</span>
+          <span>Verificando credenciales de acceso...</span>
         </div>
       </div>
     );
   }
 
-  // Production Login Screen if unauthenticated
-  if (!currentUser) {
+  // 1. PANTALLA DE INICIO DE SESIÓN CON NOMBRE DE USUARIO Y CONTRASEÑA
+  if (!user) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
+      <div className="min-h-screen bg-slate-100 flex flex-col font-sans selection:bg-[#002B49] selection:text-white">
         <header className="bg-[#002B49] text-white px-6 py-4 shadow-md flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-white/10 flex items-center justify-center border border-white/20">
@@ -542,79 +606,265 @@ export default function App() {
             </div>
           </div>
           <span className="text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 px-2.5 py-1 rounded-full font-semibold">
-            Entorno Seguro de Producción
+            Control de Acceso Seguro
           </span>
         </header>
 
         <div className="flex-1 flex items-center justify-center p-4 sm:p-6">
-          <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-slate-200 p-8 text-center space-y-6">
-            <div className="w-16 h-16 rounded-2xl bg-[#002B49]/10 text-[#002B49] mx-auto flex items-center justify-center">
-              <Lock className="w-8 h-8" />
-            </div>
-
-            <div>
-              <h2 className="text-2xl font-bold text-slate-900">Acceso Autenticado</h2>
-              <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
-                Este sistema opera en producción con control de usuarios y registro de auditoría. Por favor inicia sesión con tu cuenta corporativa.
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-slate-200 p-8 space-y-6">
+            <div className="text-center space-y-2">
+              <div className="w-14 h-14 rounded-2xl bg-[#002B49]/10 text-[#002B49] mx-auto flex items-center justify-center">
+                <Lock className="w-7 h-7" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Iniciar Sesión</h2>
+              <p className="text-xs text-slate-500">
+                Acceso restringido para asesores y personal autorizado
               </p>
             </div>
 
-            <div className="bg-slate-50 rounded-xl p-4 text-left text-xs border border-slate-200 space-y-2">
-              <div className="flex items-center gap-2 font-bold text-slate-800">
-                <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                <span>Políticas de Seguridad Activas:</span>
+            {/* Error Message */}
+            {(loginError || authError) && (
+              <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2.5 animate-in fade-in">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <div className="leading-snug">
+                  <p className="font-semibold">Atención</p>
+                  <p>{loginError || authError}</p>
+                </div>
               </div>
-              <ul className="space-y-1 text-slate-600 pl-4 list-disc text-[11px]">
-                <li>Control de acceso basado en roles (Administrador y Asesores).</li>
-                <li>Auditoría inmutable de accesos y cotizaciones en Firestore.</li>
-                <li>Reglas de seguridad endurecidas contra manipulación de datos.</li>
-              </ul>
+            )}
+
+            {/* Login Form */}
+            <form onSubmit={handleLoginSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
+                  Usuario
+                </label>
+                <div className="relative">
+                  <User className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                  <input
+                    type="text"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    autoComplete="username"
+                    value={loginUsuario}
+                    onChange={(e) => setLoginUsuario(e.target.value.toLowerCase().trim())}
+                    placeholder="ej. admin o asesor1"
+                    required
+                    className="w-full pl-9 pr-3 py-2.5 text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#002B49] focus:border-[#002B49] bg-slate-50/50"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
+                  Contraseña
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    value={loginClave}
+                    onChange={(e) => setLoginClave(e.target.value)}
+                    placeholder="••••••••"
+                    required
+                    className="w-full pl-9 pr-10 py-2.5 text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#002B49] focus:border-[#002B49] bg-slate-50/50 font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPass(!showPass)}
+                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loginSubmitting}
+                className="w-full py-3 px-4 rounded-xl bg-[#002B49] hover:bg-[#0B3A63] text-white font-bold text-sm shadow-md transition flex items-center justify-center gap-2 cursor-pointer hover:shadow-lg active:scale-[0.99] disabled:opacity-60"
+              >
+                {loginSubmitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+                    <span>Validando credenciales...</span>
+                  </>
+                ) : (
+                  <span>Entrar</span>
+                )}
+              </button>
+            </form>
+
+            <div className="pt-3 border-t border-slate-100 text-center">
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                Los usuarios son asignados exclusivamente por la corredora.
+                <br />
+                Para solicitar acceso o recuperar su clave, contacte al administrador.
+              </p>
             </div>
-
-            <button
-              onClick={() => loginWithGoogle().catch((e) => setErrorMsg(e.message))}
-              className="w-full py-3 px-4 rounded-xl bg-[#002B49] hover:bg-[#0B3A63] text-white font-bold text-sm shadow-md transition flex items-center justify-center gap-3 cursor-pointer hover:shadow-lg active:scale-[0.99]"
-            >
-              <LogIn className="w-5 h-5 text-amber-400" />
-              <span>Iniciar sesión con Google corporativo</span>
-            </button>
-
-            <p className="text-[11px] text-slate-400">
-              Administrador inicial configurado: <strong className="text-slate-600">oscar.fundepos@gmail.com</strong>
-            </p>
           </div>
         </div>
 
-        <footer className="py-3 text-center text-xs text-slate-400 bg-white border-t border-slate-200">
+        <footer className="py-3 text-center text-xs text-slate-500 bg-white border-t border-slate-200">
           BN Corredora de Seguros · Todos los derechos reservados · Costa Rica
         </footer>
       </div>
     );
   }
 
-  // Account Suspended Screen
-  if (userProfile?.status === 'suspended') {
+  // 2. CUENTA SUSPENDIDA
+  if (user.estado === 'suspendido') {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans">
         <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-rose-200 p-8 text-center space-y-4">
           <div className="w-14 h-14 rounded-full bg-rose-100 text-rose-600 mx-auto flex items-center justify-center">
             <ShieldAlert className="w-7 h-7" />
           </div>
           <h2 className="text-xl font-bold text-slate-900">Acceso Suspendido</h2>
-          <p className="text-xs text-slate-600 leading-relaxed">
-            Tu cuenta de usuario ha sido suspendida por el administrador de BN Corredora de Seguros. No tienes autorización para realizar cotizaciones en este momento.
+          <p className="text-xs text-rose-700 bg-rose-50 p-3 rounded-lg border border-rose-200 font-medium">
+            usuario suspendido, contacte al administrador
+          </p>
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Su cuenta de usuario (@{user.usuario}) se encuentra inactiva. Comuníquese con la administración de BN Corredora de Seguros para restablecer el acceso.
           </p>
           <button
             onClick={logout}
-            className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs transition cursor-pointer"
+            className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs transition cursor-pointer flex items-center justify-center gap-2"
           >
-            Cerrar sesión
+            <LogOut className="w-4 h-4" />
+            <span>Cerrar sesión</span>
           </button>
         </div>
       </div>
     );
   }
 
+  // 3. CAMBIO OBLIGATORIO DE CONTRASEÑA (debeCambiarClave === true)
+  if (user.debeCambiarClave) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col font-sans selection:bg-[#002B49] selection:text-white">
+        <header className="bg-[#002B49] text-white px-6 py-4 shadow-md flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-white/10 flex items-center justify-center border border-white/20">
+              <Shield className="w-6 h-6 text-emerald-400" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold tracking-tight">Comparador de Propuestas BN</h1>
+              <p className="text-xs text-slate-300">BN Corredora de Seguros · Costa Rica</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-200">@{user.usuario}</span>
+            <button
+              onClick={logout}
+              className="text-xs bg-white/10 hover:bg-white/20 px-2.5 py-1 rounded-lg text-white transition flex items-center gap-1 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Cerrar sesión</span>
+            </button>
+          </div>
+        </header>
+
+        <div className="flex-1 flex items-center justify-center p-4 sm:p-6">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-amber-200 p-8 space-y-6">
+            <div className="text-center space-y-2">
+              <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-700 mx-auto flex items-center justify-center">
+                <KeyRound className="w-7 h-7" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Cambio de Contraseña Obligatorio</h2>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Hola, <strong className="text-slate-800">{user.nombre}</strong>. Por motivos de seguridad institucional, debes definir una contraseña nueva y personal antes de acceder al sistema.
+              </p>
+            </div>
+
+            {claveError && (
+              <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <p>{claveError}</p>
+              </div>
+            )}
+
+            <form onSubmit={handleCambiarClaveSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
+                  Nueva contraseña
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    value={nuevaClave}
+                    onChange={(e) => setNuevaClave(e.target.value)}
+                    placeholder="Mínimo 8 caracteres y 1 número"
+                    required
+                    className="w-full pl-9 pr-10 py-2.5 text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#002B49] focus:border-[#002B49] bg-slate-50/50 font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPass(!showPass)}
+                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
+                  Confirmar nueva contraseña
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    value={confirmarClave}
+                    onChange={(e) => setConfirmarClave(e.target.value)}
+                    placeholder="Vuelve a escribir la contraseña"
+                    required
+                    className="w-full pl-9 pr-3 py-2.5 text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#002B49] focus:border-[#002B49] bg-slate-50/50 font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 text-[11px] text-slate-600 space-y-1">
+                <p className="font-semibold text-slate-700">Requisitos obligatorios:</p>
+                <div className="flex items-center gap-1.5">
+                  <span className={`w-2 h-2 rounded-full ${nuevaClave.length >= 8 ? 'bg-emerald-500' : 'bg-slate-300'}`}></span>
+                  <span>Mínimo 8 caracteres</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className={`w-2 h-2 rounded-full ${/\d/.test(nuevaClave) ? 'bg-emerald-500' : 'bg-slate-300'}`}></span>
+                  <span>Al menos un número</span>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={claveSubmitting}
+                className="w-full py-3 px-4 rounded-xl bg-[#002B49] hover:bg-[#0B3A63] text-white font-bold text-sm shadow-md transition flex items-center justify-center gap-2 cursor-pointer hover:shadow-lg disabled:opacity-60"
+              >
+                {claveSubmitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+                    <span>Guardando contraseña...</span>
+                  </>
+                ) : (
+                  <span>Guardar y acceder al comparador</span>
+                )}
+              </button>
+            </form>
+          </div>
+        </div>
+
+        <footer className="py-3 text-center text-xs text-slate-500 bg-white border-t border-slate-200">
+          BN Corredora de Seguros · Plataforma Corporativa Segura
+        </footer>
+      </div>
+    );
+  }
+
+  // 4. APLICACIÓN PRINCIPAL (Usuario autenticado con clave cambiada)
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans selection:bg-[#002B49] selection:text-white">
       {/* Top Banner / Navigation */}
@@ -656,7 +906,7 @@ export default function App() {
               type="button"
               onClick={() => setIsSavedModalOpen(true)}
               className="text-xs font-medium bg-[#0B3A63] hover:bg-[#134D80] text-white px-2.5 py-1.5 rounded-lg border border-white/15 transition flex items-center gap-1.5 shadow-xs cursor-pointer"
-              title="Ver mis comparaciones guardadas en producción"
+              title="Ver mis comparaciones guardadas en el servidor"
             >
               <History className="w-3.5 h-3.5 text-blue-300" />
               <span>Historial</span>
@@ -675,36 +925,34 @@ export default function App() {
               </button>
             )}
 
-            {/* User Profile Badge & Logout */}
-            <div className="flex items-center gap-2 pl-2 border-l border-white/20">
-              {currentUser.photoURL ? (
-                <img src={currentUser.photoURL} alt="" className="w-7 h-7 rounded-full border border-white/30" />
-              ) : (
-                <div className="w-7 h-7 rounded-full bg-white/20 text-white flex items-center justify-center text-xs font-bold">
-                  {currentUser.displayName?.charAt(0) || 'U'}
-                </div>
-              )}
-              <div className="hidden lg:block text-left">
-                <p className="text-xs font-bold text-white leading-tight truncate max-w-[130px]">
-                  {currentUser.displayName || currentUser.email}
+            {/* User Profile Badge & Logout Button visible on all screens */}
+            <div className="flex items-center gap-2 pl-3 border-l border-white/20">
+              <div className="w-7 h-7 rounded-full bg-white/20 text-white flex items-center justify-center text-xs font-bold uppercase">
+                {user.nombre.charAt(0)}
+              </div>
+              <div className="text-left">
+                <p className="text-xs font-bold text-white leading-tight truncate max-w-[130px]" title={user.nombre}>
+                  {user.nombre}
                 </p>
-                <span
-                  className={`text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded ${
-                    userProfile?.role === 'admin'
-                      ? 'bg-amber-400 text-slate-950'
-                      : 'bg-blue-300 text-blue-950'
-                  }`}
-                >
-                  {userProfile?.role === 'admin' ? 'ADMIN' : 'ASESOR'}
-                </span>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-slate-300">@{user.usuario}</span>
+                  <span
+                    className={`text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded ${
+                      isAdmin ? 'bg-amber-400 text-slate-950' : 'bg-blue-300 text-blue-950'
+                    }`}
+                  >
+                    {isAdmin ? 'ADMIN' : 'ASESOR'}
+                  </span>
+                </div>
               </div>
               <button
                 type="button"
                 onClick={logout}
-                className="p-1.5 text-slate-300 hover:text-rose-400 hover:bg-white/10 rounded-lg transition cursor-pointer"
+                className="ml-1 px-2.5 py-1.5 text-xs text-slate-200 hover:text-white bg-white/10 hover:bg-rose-600 rounded-lg transition cursor-pointer flex items-center gap-1"
                 title="Cerrar sesión"
               >
-                <LogOut className="w-4 h-4" />
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Cerrar sesión</span>
               </button>
             </div>
           </div>
@@ -945,7 +1193,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setImportMode('none')}
-                      className="text-slate-400 hover:text-slate-600 p-1"
+                      className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -1016,7 +1264,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setImportMode('none')}
-                      className="text-slate-400 hover:text-slate-600 p-1"
+                      className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -1629,7 +1877,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Save to Production Success Message */}
+            {/* Save to Server Success Message */}
             {saveSuccessMsg && (
               <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold flex items-center justify-between shadow-xs animate-in fade-in">
                 <div className="flex items-center gap-2">
@@ -1657,12 +1905,12 @@ export default function App() {
                 {isSavingRecord ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
-                    <span>Guardando en Firestore...</span>
+                    <span>Guardando en el servidor...</span>
                   </>
                 ) : (
                   <>
                     <Bookmark className="w-4 h-4 text-amber-400" />
-                    <span>Guardar en producción</span>
+                    <span>Guardar en historial</span>
                   </>
                 )}
               </button>
